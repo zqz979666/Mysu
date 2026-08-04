@@ -15,6 +15,13 @@ class ChatResponse(BaseModel):
     tool_calls: list[str] | None = Field(
         default=None, description="本次调用的工具 ID 列表（调试用）"
     )
+    # 澄清字段：当系统需要更多信息时填充，reply 为澄清问题
+    clarification: list[str] | None = Field(
+        default=None, description="需要用户补充的缺失字段列表（如 birth_date）"
+    )
+    clarification_prompt: str | None = Field(
+        default=None, description="给用户的澄清提示（可空，默认用 reply）"
+    )
 
 
 class PendingEvent(BaseModel):

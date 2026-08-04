@@ -1,23 +1,17 @@
 """
 LLM 客户端——模型网关，统一通过 OpenAI SDK 调用多种模型。
 
-整个 runtime 只有 Router 和 Generator 两个地方同步调用 LLM。
-（MemoryService.ingest 的调用是异步的，不计入请求路径。）
-
-面试话术：
-  "我们用 OpenAI SDK 做了一层薄网关——本质是一个 dict[str, OpenAI]，
-   按 model 名路由到不同 provider。不是自研，是薄封装。
-   价值在于：切换模型不需要改代码，改 config.yaml 一行就行。"
+每次调用自动落表 llm_call_logs（异步、非阻塞）。
 """
 
 import time
 import asyncio
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from openai import AsyncOpenAI
 
-from app.config import ModelGatewayConfig, ProviderConfig
+from app.config import ModelGatewayConfig
 from app.observability.logger import logger
 
 
@@ -27,7 +21,7 @@ from app.observability.logger import logger
 class LLMCallResult:
     """LLM 调用结果"""
     content: str
-    structured_output: dict | None = None   # 解析后的 JSON（如有 response_format）
+    structured_output: dict | None = None
     tokens_in: int = 0
     tokens_out: int = 0
     model: str = ""
@@ -39,27 +33,24 @@ class LLMCallConfig:
     """单次调用的配置"""
     system_prompt: str
     user_prompt: str
-    response_format: dict | None = None    # JSON Schema（Router 结构化输出用）
-    max_tokens: int | None = None           # None 则用配置默认值
-    temperature: float | None = None        # None 则用配置默认值
-    model: str | None = None                # None 则用配置 default_model
+    response_format: dict | None = None
+    max_tokens: int | None = None
+    temperature: float | None = None
+    model: str | None = None
+    # 调用上下文（用于落表）
+    call_type: str = ""        # "router" | "generator" | "ingest"
+    request_id: str = ""
+    session_id: str = ""
 
 
 # ── 模型网关 ────────────────────────────────────────────────
 
 class LLMClient:
-    """模型网关——按 model 名路由到不同的 OpenAI-compatible provider。
-
-    面试话术：
-      "这不是自研的 LLM 框架。就是一个 dict[str, AsyncOpenAI]，
-      构造函数里按 config.providers 建 client。call() 的时候
-      按 model 名 O(1) 查到对应 client，其余全部透传给 OpenAI SDK。"
-    """
+    """模型网关 + LLM 调用日志落表。"""
 
     def __init__(self, config: ModelGatewayConfig):
         self.config = config
 
-        # ── 为每个 provider 建一个 AsyncOpenAI client ──────
         self._clients: dict[str, AsyncOpenAI] = {}
         self._model_to_provider: dict[str, str] = {}
 
@@ -76,16 +67,10 @@ class LLMClient:
     # ── 对外接口 ───────────────────────────────────────
 
     async def call(self, config: LLMCallConfig) -> LLMCallResult:
-        """同步 LLM 调用（带重试 + token 埋点）。
+        """同步 LLM 调用（带重试 + 日志落表）。
 
         Args:
-            config: 调用配置
-
-        Returns:
-            LLMCallResult
-
-        Raises:
-            RuntimeError: 所有重试耗尽后仍失败
+            config: 调用配置（含 call_type/request_id/session_id 用于落表）
         """
         t0 = time.monotonic()
 
@@ -111,11 +96,9 @@ class LLMClient:
             {"role": "user", "content": config.user_prompt},
         ]
 
-        # ── 结构化输出：统一用 json_object 模式（兼容所有 provider） ──
         extra_kwargs: dict = {}
         if config.response_format is not None:
             extra_kwargs["response_format"] = {"type": "json_object"}
-            # 把 schema 注入 system prompt（兼容不支持 json_schema 的 provider）
             schema_str = json.dumps(config.response_format, ensure_ascii=False)
             messages[0]["content"] += (
                 f"\n\n你必须返回一个 JSON 对象，严格遵循以下 schema:\n{schema_str}"
@@ -145,9 +128,6 @@ class LLMClient:
                             f"LLM 返回的不是合法 JSON，将作为纯文本处理。"
                             f" model={model} raw={content[:200]}"
                         )
-                        structured = None
-                        # 如果是 Router 调用且结构化输出必须，在 prompt 里已说明
-                        # 这里不抛异常——让上层根据 None 走 fallback
 
                 usage = response.usage
                 result = LLMCallResult(
@@ -164,6 +144,18 @@ class LLMClient:
                     f" tokens_in={result.tokens_in} tokens_out={result.tokens_out}"
                     f" latency={result.latency_ms:.0f}ms"
                 )
+
+                # ── 异步落表（不阻塞请求路径） ──────────
+                asyncio.create_task(
+                    self._log_call_to_db(
+                        config=config,
+                        model=model,
+                        provider=provider_name,
+                        result=result,
+                        structured_output=structured,
+                    )
+                )
+
                 return result
 
             except Exception as e:
@@ -176,16 +168,96 @@ class LLMClient:
                     delay = 2 ** attempt
                     await asyncio.sleep(delay)
 
+        # ── 所有重试失败，也落表 ────────────────────────
+        asyncio.create_task(
+            self._log_failure_to_db(
+                config=config,
+                model=model,
+                provider=provider_name,
+                error=last_error or "unknown",
+            )
+        )
+
         raise RuntimeError(
             f"LLM 调用失败（{self.config.max_retries} 次重试后）:"
             f" model={model} error={last_error}"
         )
 
+    async def _log_call_to_db(
+        self,
+        config: LLMCallConfig,
+        model: str,
+        provider: str,
+        result: LLMCallResult,
+        structured_output: dict | None,
+    ) -> None:
+        """将成功调用写入 llm_call_logs 表"""
+        try:
+            from app.storage.database import db_execute
+
+            await db_execute(
+                """INSERT INTO llm_call_logs (
+                    request_id, session_id, call_type, model, provider,
+                    tokens_in, tokens_out, latency_ms,
+                    system_prompt_snippet, user_prompt_snippet, response_snippet,
+                    structured_output_json, success
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)""",
+                (
+                    config.request_id,
+                    config.session_id,
+                    config.call_type,
+                    model,
+                    provider,
+                    result.tokens_in,
+                    result.tokens_out,
+                    result.latency_ms,
+                    config.system_prompt[:500],
+                    config.user_prompt[:500],
+                    result.content[:500],
+                    json.dumps(structured_output, ensure_ascii=False)
+                    if structured_output
+                    else None,
+                ),
+            )
+        except Exception as e:
+            logger.error(f"LLM 调用日志落表失败: {e}")
+
+    async def _log_failure_to_db(
+        self,
+        config: LLMCallConfig,
+        model: str,
+        provider: str,
+        error: str,
+    ) -> None:
+        """将失败调用写入 llm_call_logs 表"""
+        try:
+            from app.storage.database import db_execute
+
+            await db_execute(
+                """INSERT INTO llm_call_logs (
+                    request_id, session_id, call_type, model, provider,
+                    tokens_in, tokens_out, latency_ms,
+                    system_prompt_snippet, user_prompt_snippet,
+                    success, error_message
+                ) VALUES (?, ?, ?, ?, ?, 0, 0, 0, ?, ?, 0, ?)""",
+                (
+                    config.request_id,
+                    config.session_id,
+                    config.call_type,
+                    model,
+                    provider,
+                    config.system_prompt[:500],
+                    config.user_prompt[:500],
+                    error[:500],
+                ),
+            )
+        except Exception as e:
+            logger.error(f"LLM 失败日志落表失败: {e}")
+
     # ── 健康检查 ───────────────────────────────────────
 
     @property
     def is_ready(self) -> bool:
-        """是否有至少一个可用 provider"""
         return len(self._clients) > 0 and len(self._model_to_provider) > 0
 
     @property

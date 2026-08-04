@@ -1,11 +1,7 @@
 """
 Generator——LLM 决策点②：汇总生成回复。
 
-这是整个 runtime 两个同步 LLM 调用点中的第二个。
-输入：用户消息 + 上下文 + 工具输出 + 知识片段
-输出：自然语言回复
-
-零决策——LLM 只做表达，不做规划。所有决策（意图/工具/参数）在 Router 就做完了。
+零决策——LLM 只做表达，不做规划。
 """
 
 from app.llm.llm_client import LLMClient, LLMCallConfig
@@ -26,28 +22,19 @@ GENERATOR_SYSTEM_PROMPT = """你是 Mysu，一位玄学陪伴助手。
 
 
 class Generator:
-    """回复生成器——LLM 决策点②。
-
-    面试话术：Router 做决策，Generator 做表达。
-    两个调用点的职责边界泾渭分明——Router 决定「做什么」，
-    Generator 决定「怎么说」。Generator 没有工具选择权，
-    没有循环，它就是一个有上下文的翻译器。
-    """
+    """回复生成器——LLM 决策点②。"""
 
     def __init__(self, llm_client: LLMClient):
         self.llm = llm_client
+        self.last_tokens_in: int = 0
+        self.last_tokens_out: int = 0
 
-    async def generate(self, ctx: GeneratorContext) -> str:
-        """生成自然语言回复。
-
-        Args:
-            ctx: ContextBuilder 组装完成的上下文
-
-        Returns:
-            自然语言回复文本
-
-        TODO: 当前占位实现，对接 LLM 真实调用。
-        """
+    async def generate(
+        self,
+        ctx: GeneratorContext,
+        request_id: str = "",
+        session_id: str = "",
+    ) -> str:
         user_prompt = ctx.user_message
         if ctx.tool_outputs:
             user_prompt += f"\n\n{ctx.tool_outputs}"
@@ -59,7 +46,13 @@ class Generator:
                 system_prompt=GENERATOR_SYSTEM_PROMPT
                 + "\n\n" + ctx.system_prompt_fragment,
                 user_prompt=user_prompt,
+                call_type="generator",
+                request_id=request_id,
+                session_id=session_id,
             )
         )
+
+        self.last_tokens_in = result.tokens_in
+        self.last_tokens_out = result.tokens_out
 
         return result.content

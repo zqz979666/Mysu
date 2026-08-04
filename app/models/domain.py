@@ -53,6 +53,25 @@ class ToolSpec(ABC):
         """执行工具。可以是纯函数或异步子 agent。"""
         ...
 
+    def validate_params(self, params: dict) -> list[str]:
+        """检查参数是否足以执行本工具。
+
+        默认实现：对照 schema.required，缺失返回描述列表。
+        子类可重写以表达更复杂的约束（如"sign 或 birth_date 至少一个"）。
+
+        Args:
+            params: 注入画像后的参数（可能仍缺失）
+
+        Returns:
+            缺失/无效参数的人类可读描述列表；空列表 = 可以执行
+        """
+        missing: list[str] = []
+        required = (self.schema or {}).get("required", [])
+        for field in required:
+            if not params.get(field):
+                missing.append(f"缺少参数: {field}")
+        return missing
+
     def to_embedding_text(self) -> str:
         """生成用于向量检索的文本（ToolMatcher 用）"""
         return f"{self.display_name} {self.description}"
