@@ -4,7 +4,7 @@
 # 环境变量注入：api_key 值以 $ 开头时从环境变量读取。
 #   例: api_key: "$DEEPSEEK_API_KEY" → 读取 os.environ["DEEPSEEK_API_KEY"]
 
-default_model: "qwen2.5:3b"           # 默认使用的模型名
+default_model: "qwen3.5:9b"           # 默认使用的模型名
 default_max_tokens: 2048               # 单次调用最大输出 token
 default_temperature: 0.7               # 默认温度
 
@@ -18,7 +18,7 @@ providers:
     api_key: "ollama"                  # Ollama 不需要真 key，占位即可
     models:
       - "qwen2.5:3b"
-      - "qwen2.5:7b"
+      - "qwen3.5:9b"
       - "qwen2.5:14b"
 
   # ── DeepSeek ───────────────────────────────────────

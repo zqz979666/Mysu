@@ -46,6 +46,10 @@ class TarotDrawTool(ToolSpec):
             schema=TAROT_DRAW_SCHEMA,
         )
 
+    def validate_params(self, params: dict) -> list[str]:
+        # count 有默认值 1，缺省即可执行，无需澄清
+        return []
+
     async def execute(self, params: dict, ctx: ExecutionContext) -> ToolResult:
         count = params.get("count", 1)
         question = params.get("question", "")

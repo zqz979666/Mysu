@@ -32,8 +32,8 @@ class ToolMatcher:
 
     def __init__(self, top_k: int = 10):
         self.top_k = top_k
-        # 同义词映射: alias → tool_id
-        self._aliases: dict[str, str] = {}
+        # 同义词映射: alias → tool_id 或 [tool_id, ...]（多值用于主题词）
+        self._aliases: dict[str, str | list[str]] = {}
         # 所有已注册的工具
         self._all_tools: list[ToolSpec] = []
 
@@ -41,8 +41,8 @@ class ToolMatcher:
         """注册单个同义词"""
         self._aliases[alias] = tool_id
 
-    def add_aliases(self, mapping: dict[str, str]) -> None:
-        """批量注册同义词"""
+    def add_aliases(self, mapping: dict[str, str | list[str]]) -> None:
+        """批量注册同义词（值可以是单个 tool_id 或列表）"""
         self._aliases.update(mapping)
 
     async def rebuild_index(self, tools: list[ToolSpec]) -> None:
@@ -75,10 +75,17 @@ class ToolMatcher:
                 if tool.tool_id not in candidates:
                     candidates.append(tool.tool_id)
 
-        # ── 2. 同义词匹配 ─────────────────────────
-        for alias, tool_id in self._aliases.items():
-            if alias in msg and tool_id not in candidates:
-                candidates.append(tool_id)
+        # ── 2. 同义词匹配（值可为单个 tool_id 或列表）──
+        for alias, value in self._aliases.items():
+            if alias not in msg:
+                continue
+            if isinstance(value, list):
+                for tid in value:
+                    if tid not in candidates:
+                        candidates.append(tid)
+            else:
+                if value not in candidates:
+                    candidates.append(value)
 
         # ── 3. 关键词匹配 ─────────────────────────
         # 工具 description 中的关键词命中

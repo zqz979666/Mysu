@@ -132,9 +132,9 @@ def _create_tables(conn: sqlite3.Connection) -> None:
             tokens_in INTEGER NOT NULL DEFAULT 0,
             tokens_out INTEGER NOT NULL DEFAULT 0,
             latency_ms REAL NOT NULL DEFAULT 0.0,
-            system_prompt_snippet TEXT,    -- 前 500 字符
-            user_prompt_snippet TEXT,      -- 前 500 字符
-            response_snippet TEXT,         -- 前 500 字符
+            system_prompt_snippet TEXT,    -- 完整 system prompt（不再截断）
+            user_prompt_snippet TEXT,      -- 完整 user prompt（不再截断）
+            response_snippet TEXT,         -- 完整输出（LLM 全文响应，不再截断）
             structured_output_json TEXT,   -- Router 的结构化输出
             success INTEGER NOT NULL DEFAULT 1,
             error_message TEXT,
@@ -167,11 +167,31 @@ def _create_tables(conn: sqlite3.Connection) -> None:
             user_id TEXT NOT NULL,
             tool_id TEXT NOT NULL,        -- 等待哪个工具的参数
             missing_params TEXT NOT NULL, -- JSON 数组，如 ["birth_date"]
+            partial_params TEXT NOT NULL DEFAULT '{}', -- JSON，多轮澄清累积的已收集参数
             ask_message TEXT NOT NULL,    -- 当时问用户的问题
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             FOREIGN KEY (user_id) REFERENCES user_profiles(user_id)
         );
+
+        -- 会话级记忆提炼标记（幂等：每个 session 只提炼一次）
+        CREATE TABLE IF NOT EXISTS memory_extractions (
+            session_id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            extracted_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_mem_extract_user ON memory_extractions(user_id);
     """)
+    # 兼容旧库：补 partial_params 列（已存在则忽略）
+    try:
+        conn = _get_conn()
+        conn.execute(
+            "ALTER TABLE pending_clarifications "
+            "ADD COLUMN partial_params TEXT NOT NULL DEFAULT '{}'"
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass  # 列已存在
 
 
 # ── 查询辅助 ────────────────────────────────────────────────

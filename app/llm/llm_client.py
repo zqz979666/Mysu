@@ -99,9 +99,13 @@ class LLMClient:
         extra_kwargs: dict = {}
         if config.response_format is not None:
             extra_kwargs["response_format"] = {"type": "json_object"}
-            schema_str = json.dumps(config.response_format, ensure_ascii=False)
+            # 不注入完整 schema 原文——小模型会原样回显 schema 而非生成数据。
+            # 改为注入字段名列表（轻量指引，降低回显概率）。
+            field_names = list(config.response_format.get("properties", {}).keys())
+            field_hint = ", ".join(field_names) if field_names else "合法JSON"
             messages[0]["content"] += (
-                f"\n\n你必须返回一个 JSON 对象，严格遵循以下 schema:\n{schema_str}"
+                f"\n\n你必须返回一个 JSON 对象，包含以下字段：{field_hint}。"
+                f"不要输出 schema 定义本身，直接输出数据。"
             )
 
         # ── 重试循环 ──────────────────────────────────
@@ -122,7 +126,22 @@ class LLMClient:
                 structured = None
                 if config.response_format is not None:
                     try:
-                        structured = json.loads(content)
+                        parsed = json.loads(content)
+                        # 回显检测：如果返回的是 schema 定义本身（含 "type"+"properties"
+                        # 且缺业务字段），视为生成失败
+                        expected = set(config.response_format.get("properties", {}).keys())
+                        if (
+                            isinstance(parsed, dict)
+                            and "properties" in parsed
+                            and not (expected & set(parsed.keys()))
+                        ):
+                            logger.warning(
+                                f"LLM 回显了 schema 而非数据（model={model}）"
+                                f"——将作为解析失败处理"
+                            )
+                            structured = None
+                        else:
+                            structured = parsed
                     except json.JSONDecodeError:
                         logger.warning(
                             f"LLM 返回的不是合法 JSON，将作为纯文本处理。"
@@ -211,9 +230,9 @@ class LLMClient:
                     result.tokens_in,
                     result.tokens_out,
                     result.latency_ms,
-                    config.system_prompt[:500],
-                    config.user_prompt[:500],
-                    result.content[:500],
+                    config.system_prompt,
+                    config.user_prompt,
+                    result.content,
                     json.dumps(structured_output, ensure_ascii=False)
                     if structured_output
                     else None,
@@ -246,9 +265,9 @@ class LLMClient:
                     config.call_type,
                     model,
                     provider,
-                    config.system_prompt[:500],
-                    config.user_prompt[:500],
-                    error[:500],
+                    config.system_prompt,
+                    config.user_prompt,
+                    error,
                 ),
             )
         except Exception as e:

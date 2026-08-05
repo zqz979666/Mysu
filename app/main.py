@@ -142,6 +142,16 @@ async def events_pending(req: EventsPendingRequest) -> EventsPendingResponse:
     return EventsPendingResponse(events=[], latest_event_id=req.mark_id)
 
 
+@app.post("/api/memory/extract")
+async def memory_extract(session_id: str):
+    """手动触发一个会话的会话级记忆提炼（画像/长期事实/偏好）。
+
+    正常情况下 session 切换会自动触发；此端点用于补提炼。
+    """
+    ok = await agent_service.memory.extract_session_memory(session_id, "default")
+    return {"extracted": ok, "session_id": session_id}
+
+
 # ── Debug 接口 ──────────────────────────────────
 
 
@@ -174,7 +184,7 @@ async def debug_profile(user_id: str):
 
 @app.get("/api/debug/llm-logs")
 async def debug_llm_logs(limit: int = 20):
-    """查询最近的 LLM 调用记录"""
+    """查询最近的 LLM 调用记录（列表视图，仅预览）"""
     rows = await db_fetch_all(
         "SELECT id, request_id, call_type, model, tokens_in, tokens_out, "
         "round(latency_ms,0) as latency_ms, success, "
@@ -182,8 +192,26 @@ async def debug_llm_logs(limit: int = 20):
         "created_at "
         "FROM llm_call_logs ORDER BY id DESC LIMIT ?",
         (limit,),
+        _log=False,
     )
     return {"count": len(rows), "logs": [dict(r) for r in rows]}
+
+
+@app.get("/api/debug/llm-log/{log_id}")
+async def debug_llm_log_detail(log_id: int):
+    """查询单条 LLM 调用记录——完整 prompt / response / 结构化输出"""
+    row = await db_fetch_one(
+        "SELECT id, request_id, session_id, call_type, model, provider, "
+        "tokens_in, tokens_out, round(latency_ms,0) as latency_ms, "
+        "system_prompt_snippet, user_prompt_snippet, response_snippet, "
+        "structured_output_json, success, error_message, created_at "
+        "FROM llm_call_logs WHERE id=?",
+        (log_id,),
+        _log=False,
+    )
+    if row is None:
+        return {"found": False, "log_id": log_id}
+    return {"found": True, "log": dict(row)}
 
 
 @app.get("/api/debug/readings/{user_id}")
@@ -227,8 +255,15 @@ async def debug_db_logs(limit: int = 30, table: str = ""):
 
 @app.post("/api/debug/reset-profile")
 async def debug_reset_profile(user_id: str = "default"):
-    """重置指定用户的画像（调试用）——级联清理子表数据。"""
+    """重置指定用户的画像（调试用）——级联清理子表数据。
+
+    顺序必须先子后父：pending_clarifications 和 session_state 都
+    FK 引用 user_profiles——漏删 pending 会导致 DELETE user_profiles
+    触发 FOREIGN KEY constraint failed，reset 静默失败。
+    """
     # 先删子表（外键约束），再删画像
+    await db_execute("DELETE FROM pending_clarifications WHERE user_id=?",
+                     (user_id,), context="debug_reset")
     await db_execute("DELETE FROM session_state WHERE user_id=?", (user_id,),
                      context="debug_reset")
     await db_execute("DELETE FROM readings WHERE user_id=?", (user_id,),
@@ -238,4 +273,5 @@ async def debug_reset_profile(user_id: str = "default"):
     await db_execute("DELETE FROM user_profiles WHERE user_id=?", (user_id,),
                      context="debug_reset")
     return {"status": "reset", "user_id": user_id,
-            "cleaned": ["session_state", "readings", "long_term_facts", "user_profiles"]}
+            "cleaned": ["pending_clarifications", "session_state", "readings",
+                        "long_term_facts", "user_profiles"]}

@@ -18,6 +18,31 @@ class LoadedContext:
     short_term_state: list[dict] = field(default_factory=list)  # L3
     previous_results: list[dict] = field(default_factory=list)
 
+    def to_system_prompt_fragment(self) -> str:
+        """将 LoadedContext 转换为 system_prompt 注入片段。
+
+        面试话术：ContextBuilder 负责拼装 + token 预算控制，
+        这里只是数据→文本的转换，不涉及截断逻辑。
+        """
+        parts: list[str] = []
+
+        if self.user_profile:
+            profile_str = ", ".join(
+                f"{k}={v}" for k, v in self.user_profile.items()
+            )
+            parts.append(f"[用户画像] {profile_str}")
+
+        if self.long_term_facts:
+            facts_str = "; ".join(
+                f.get("content", "") for f in self.long_term_facts
+            )
+            parts.append(f"[长期事实] {facts_str}")
+
+        if self.recent_readings:
+            parts.append(f"[近期测算记录] {len(self.recent_readings)} 条")
+
+        return "\n".join(parts)
+
 
 class ContextLoader:
     """上下文加载器。
@@ -52,27 +77,7 @@ class ContextLoader:
 
         return ctx
 
-    def to_system_prompt_fragment(self, ctx: LoadedContext) -> str:
-        """将 LoadedContext 转换为 system_prompt 注入片段。
-
-        面试话术：ContextBuilder 负责拼装 + token 预算控制，
-        这里只是数据→文本的转换，不涉及截断逻辑。
-        """
-        parts: list[str] = []
-
-        if ctx.user_profile:
-            profile_str = ", ".join(
-                f"{k}={v}" for k, v in ctx.user_profile.items()
-            )
-            parts.append(f"[用户画像] {profile_str}")
-
-        if ctx.long_term_facts:
-            facts_str = "; ".join(
-                f.get("content", "") for f in ctx.long_term_facts
-            )
-            parts.append(f"[长期事实] {facts_str}")
-
-        if ctx.recent_readings:
-            parts.append(f"[近期测算记录] {len(ctx.recent_readings)} 条")
-
-        return "\n".join(parts)
+    # 注意：to_system_prompt_fragment 已移到 LoadedContext（数据类）上——
+    # Router/ContextBuilder 拿到的是 LoadedContext 实例，方法必须定义在
+    # 数据类上才能被 hasattr 命中。历史 bug：定义在 ContextLoader 上导致
+    # 画像/长期事实从未注入 Router 与 Generator 的 prompt。

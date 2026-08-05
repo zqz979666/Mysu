@@ -151,21 +151,40 @@ _ZODIAC_NAME_TO_ID = {
 # 自指语言模式：只有匹配这些模式时才认为用户在说自己
 _RE_SELF_REFERENCE = re.compile(
     r"我是.{0,12}(?:座|的|出生)"
-    r"|我的.{0,12}(?:生日|星座|星盘|出生)"
+    r"|我的.{0,12}(?:生日|星座|星盘|出生|运势|财运|爱情|事业|健康|学业|感情|工作)"
     r"|我生日|我出生于|我.{0,5}出生"
     r"|帮我算.{0,5}(?:星盘|运势|命盘)"
     r"|给我算.{0,5}(?:星盘|运势|命盘)"
 )
 
+# 强自指星座：星座名紧跟"我是"（仅允许"个"），最高置信的自述模式。
+# 用于 LLM 未提取到时的双保险——只认这个模式，绝不覆盖"他是白羊座"。
+_RE_STRONG_SELF_SIGN = re.compile(
+    r"我是(?:个)?(白羊|金牛|双子|巨蟹|狮子|处女|天秤|天蝎|射手|摩羯|水瓶|双鱼)\s*座?"
+)
+
+
+def _extract_strong_self_sign(text: str) -> dict:
+    """提取强自指星座（"我是XX座"）——regex 双保险专用，最严格。"""
+    m = _RE_STRONG_SELF_SIGN.search(text)
+    if not m:
+        return {}
+    sign_id = _ZODIAC_NAME_TO_ID.get(m.group(1))
+    return {"zodiac_sign": sign_id} if sign_id else {}
+
 
 def _has_self_reference(text: str) -> bool:
-    """判断文本是否在描述用户自己的信息（而非打听他人）。"""
+    """判断文本是否在描述用户自己的信息（而非打听他人）。
+
+    仅用于 LLM 不可用时的 regex 兜底，不参与 LLM 判断路径。
+    """
     return bool(_RE_SELF_REFERENCE.search(text))
 
 
-def _extract_profile_hints(text: str, allow_bare: bool = False) -> dict:
+def _extract_profile_hints(text: str) -> dict:
     """从文本中提取用户画像线索（纯正则，零 LLM）。
 
+    仅作为 LLM 不可用时的兜底。LLM 可用时画像提取由 LLM 全权判断。
     只提取自指性信息——用户明确在说自己时才保存。
     例如：
       "我是白羊座"       → 提取 zodiac_sign=aries
@@ -173,15 +192,11 @@ def _extract_profile_hints(text: str, allow_bare: bool = False) -> dict:
       "看看白羊座运势"    → 不提取（打听他人信息）
       "帮我算算星盘"       → 不提取（没有具体数据，只是请求）
 
-    Args:
-        allow_bare: 宽松模式（跳过自指检查）——用于澄清回答场景，
-                    用户直接给出"1995年6月15日"这类裸信息。
-
     Returns:
         提取到的字段 dict（只包含非空字段）
     """
     # 安全检查：用户是否在说自己的信息？
-    if not allow_bare and not _has_self_reference(text):
+    if not _has_self_reference(text):
         return {}
 
     hints: dict = {}
@@ -324,7 +339,7 @@ class MemoryService:
         """获取当前会话状态"""
         rows = await db_fetch_all(
             "SELECT role, content FROM session_state "
-            "WHERE session_id=? ORDER BY turn_index DESC LIMIT ?",
+            "WHERE session_id=? ORDER BY turn_index DESC, id DESC LIMIT ?",
             (session_id, limit),
         )
         return list(reversed([dict(r) for r in rows]))
@@ -342,6 +357,7 @@ class MemoryService:
                 "assistant_reply": "...",
                 "intent": "execute",
                 "tool_results": [{"tool_id": "...", "success": True}, ...],
+                "expect_fields": ["birth_date", ...],  # 可选：澄清上下文
             }
         """
         user_msg = turn.get("user_message", "")
@@ -349,10 +365,11 @@ class MemoryService:
         intent = turn.get("intent", "")
         tool_results = turn.get("tool_results", [])
 
-        # ── 1. 登记/更新用户画像（LLM 提取）───────
+        # ── 1. 登记/更新用户画像（即时提取，仅强自指）──
+        # 只信"我是/我的"；替他人询问（"他是我朋友，白羊座"）绝不落库。
+        # 澄清回答的归属判断由 session 级提炼（extract_session_memory）负责。
         await self._ensure_profile(user_id)
 
-        # 使用 LLM 提取（如果可用），回退到 regex
         hints = await self._extract_profile_llm(user_msg)
         if hints:
             await self._update_profile_from_hints(user_id, hints)
@@ -479,26 +496,40 @@ class MemoryService:
     # ── LLM 画像提取 ──────────────────────────────
 
     async def _extract_profile_llm(
-        self, user_msg: str, allow_bare: bool = False
+        self,
+        user_msg: str,
     ) -> dict:
         """用 LLM 提取用户画像（如果可用），回退到 regex。
 
-        Args:
-            allow_bare: 宽松模式。True 时跳过"自指语言"预过滤——
-                        用于用户在澄清回答中直接给出"1995年6月15日"这类裸信息。
+        核心原则：不做规则预判（自指检测/关键词过滤）——LLM 全权判断
+        用户是否在自述、提取哪些字段。仅强自指（"我是/我的"）会被提取；
+        替他人转述的信息由会话级提炼负责（见 extract_session_memory）。
         """
-        # 尝试 LLM
+        # 尝试 LLM（无任何规则预判）
         if self.llm is not None:
             try:
                 if self._extractor is None:
                     from app.memory.profile_extractor import ProfileExtractor
                     self._extractor = ProfileExtractor(self.llm)
-                return await self._extractor.extract(user_msg, allow_bare=allow_bare)
+                llm_hints = await self._extractor.extract(user_msg)
             except Exception:
-                pass  # 失败静默，回退到 regex
+                llm_hints = {}
+            # LLM 提取成功 → 直接采用
+            if llm_hints:
+                return llm_hints
+            # LLM 未提取到（3B 小模型抽风/理解偏差）→ 强自指双保险。
+            # 只认"我是XX座"这种最高置信模式（regex 兜底太粗，会把
+            # "帮我算下我朋友的运势，他是白羊座"误判成自指，污染画像）。
+            regex_hints = _extract_strong_self_sign(user_msg)
+            if regex_hints:
+                logger.info(
+                    f"画像提取: LLM 未提取到，regex 强自指兜底命中 {regex_hints}"
+                )
+                return regex_hints
+            return {}
 
-        # 回退到 regex
-        return _extract_profile_hints(user_msg, allow_bare=allow_bare)
+        # 无 LLM：纯 regex 兜底
+        return _extract_profile_hints(user_msg)
 
     # ── 待澄清状态 ────────────────────────────────
 
@@ -525,6 +556,25 @@ class MemoryService:
             f"missing={missing}"
         )
 
+    async def update_pending_clarification(
+        self, session_id: str,
+        missing: list[str], partial: dict, ask_message: str,
+    ) -> None:
+        """多轮澄清：更新仍缺的字段 + 累积已收集的参数。"""
+        await db_execute(
+            """UPDATE pending_clarifications SET
+                 missing_params=?, partial_params=?, ask_message=?
+               WHERE session_id=?""",
+            (json.dumps(missing, ensure_ascii=False),
+             json.dumps(partial, ensure_ascii=False),
+             ask_message, session_id),
+            context="clarification",
+        )
+        logger.info(
+            f"澄清累积: session={session_id} missing={missing} "
+            f"partial={partial}"
+        )
+
     async def get_pending_clarification(
         self, session_id: str
     ) -> dict | None:
@@ -537,6 +587,9 @@ class MemoryService:
             return None
         result = dict(row)
         result["missing_params"] = json.loads(result["missing_params"])
+        result["partial_params"] = json.loads(
+            result.get("partial_params") or "{}"
+        )
         return result
 
     async def clear_pending_clarification(self, session_id: str) -> None:
@@ -545,3 +598,86 @@ class MemoryService:
             "DELETE FROM pending_clarifications WHERE session_id=?",
             (session_id,), context="clarification",
         )
+
+    # ── 会话级记忆提炼（session 结束后全量判断）──────────────
+    # USER-DIRECTED：即时提取只信强自指；替他人询问（"帮我朋友算，他
+    # 是白羊座"）的归属判断、长期事实、偏好，统一由本方法在 session
+    # 结束后用全量对话上下文交给 LLM 判断。这是画像落库的权威入口之一。
+
+    async def extract_session_memory(
+        self, session_id: str, user_id: str
+    ) -> bool:
+        """提炼一个已结束会话的长期记忆。
+
+        读该会话全量对话 → LLM 判断（画像字段 + 长期事实 + 偏好）→ 落库。
+        幂等：每个 session 只提炼一次（memory_extractions 标记）。
+
+        Returns:
+            True=提炼并落库了至少一类记忆；False=无内容/已提炼/无 LLM
+        """
+        # 幂等：已提炼过则跳过
+        done = await db_fetch_one(
+            "SELECT 1 FROM memory_extractions WHERE session_id=?",
+            (session_id,), context="memory_extract",
+        )
+        if done:
+            return False
+
+        # 读该会话全量对话（按轮次正序）
+        rows = await db_fetch_all(
+            "SELECT role, content FROM session_state "
+            "WHERE session_id=? ORDER BY turn_index ASC, id ASC",
+            (session_id,), context="memory_extract",
+        )
+        if not rows:
+            return False
+
+        transcript = "\n".join(
+            f"[{'用户' if r['role'] == 'user' else '助手'}] {r['content']}"
+            for r in rows
+        )
+        # 超长会话截断保护（保留最近部分）
+        if len(transcript) > 8000:
+            transcript = "…(前文省略)…\n" + transcript[-8000:]
+
+        if self.llm is None:
+            return False
+
+        from app.memory.profile_extractor import extract_session_memory as _extract
+        memory = await _extract(self.llm, transcript)
+
+        profile = memory.get("profile") or {}
+        if profile:
+            await self._ensure_profile(user_id)
+            await self._update_profile_from_hints(user_id, profile)
+            logger.info(
+                f"会话级提炼画像: user={user_id} session={session_id} "
+                f"hints={profile}"
+            )
+
+        for f in memory.get("facts") or []:
+            await self.add_fact(
+                user_id, f.get("type", "life_event"), f.get("content", ""),
+                session_id=session_id,
+            )
+        if facts := memory.get("facts"):
+            logger.info(
+                f"会话级提炼事实: user={user_id} session={session_id} "
+                f"facts={facts}"
+            )
+
+        prefs = memory.get("preferences") or {}
+        if prefs:
+            await self.update_profile(user_id, {"preferences": prefs})
+            logger.info(
+                f"会话级提炼偏好: user={user_id} session={session_id} "
+                f"prefs={prefs}"
+            )
+
+        # 标记已提炼（无论是否有内容，避免反复空转）
+        await db_execute(
+            "INSERT INTO memory_extractions (session_id, user_id) "
+            "VALUES (?, ?) ON CONFLICT(session_id) DO NOTHING",
+            (session_id, user_id), context="memory_extract",
+        )
+        return bool(profile or memory.get("facts") or prefs)

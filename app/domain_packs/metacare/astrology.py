@@ -27,6 +27,7 @@ from app.domain_packs.metacare._astrology_engine import (
     compute_transits,
     interpret_transits_for_horoscope,
 )
+from app.domain_packs.metacare._time_parser import parse_query_date
 
 logger = logging.getLogger("mysu.astrology")
 
@@ -47,6 +48,21 @@ def _parse_date(date_str: str) -> date:
         except (ValueError, AttributeError):
             continue
     return date.today()
+
+
+def _parse_query_date(date_str: str, today: date) -> date:
+    """解析查询日期（date 参数）：绝对/相对表达 → 具体日期；失败回退今天并告警。
+
+    Router 可能把用户消息里的时间词原样填进 date（"下周"），也可能直接填
+    绝对日期。相对表达由确定性 _time_parser 解析——绝不让 LLM 心算日期。
+    """
+    if not date_str or not date_str.strip():
+        return today
+    parsed = parse_query_date(date_str, today)
+    if parsed is not None:
+        return parsed
+    logger.warning(f"date 参数无法解析，回退今天: {date_str!r}")
+    return today
 
 
 # ── ToolSpec: birth_chart ───────────────────────────────────
@@ -240,7 +256,9 @@ class DailyTransitTool(ToolSpec):
         # ── Step 1: 解析输入 ──────────────────────
         birth_date = _parse_date(params.get("birth_date", ""))
         birth_time = params.get("birth_time", "").strip() or "12:00"
-        query_date = _parse_date(params.get("date", "").strip() or date.today().isoformat())
+        query_date = _parse_query_date(
+            params.get("date", "").strip(), date.today()
+        )
         _step_log("Step 1/6 输入解析",
                   birth_date=birth_date.isoformat(), birth_time=birth_time,
                   query_date=query_date.isoformat())
@@ -328,6 +346,10 @@ HOROSCOPE_DAILY_SCHEMA = {
             "type": "string",
             "description": "出生时间 HH:MM，配合 birth_date 使用",
         },
+        "date": {
+            "type": "string",
+            "description": "要查询的日期 YYYY-MM-DD。用户说'下周/明天/这周/周一'等时间时，填入对应日期；不填默认今天。",
+        },
     },
     "required": [],
 }
@@ -340,7 +362,7 @@ class HoroscopeDailyTool(ToolSpec):
         super().__init__(
             tool_id="horoscope_daily",
             display_name="每日星座运势",
-            description="查询星座今日运势。如果提供出生日期，则基于本命盘和流年星象精确计算；如果只提供星座名，则给出该星座基于当前行星位置的通用运势。",
+            description="查询星座今日运势。如果提供出生日期，则基于本命盘和流年星象精确计算；如果只提供星座名，则给出该星座基于当前行星位置的通用运势。支持指定日期（date 参数），如'下周运势'会按对应日期计算。",
             schema=HOROSCOPE_DAILY_SCHEMA,
         )
 
@@ -357,10 +379,12 @@ class HoroscopeDailyTool(ToolSpec):
         birth_date_str = params.get("birth_date", "").strip()
         birth_time = params.get("birth_time", "").strip() or "12:00"
         today = date.today()
+        query_date = _parse_query_date(params.get("date", "").strip(), today)
 
         _step_log("Step 1/4 输入解析",
                   sign=sign_input, birth_date=birth_date_str,
-                  birth_time=birth_time, today=today.isoformat())
+                  birth_time=birth_time, today=today.isoformat(),
+                  query_date=query_date.isoformat())
 
         # ── 有出生日期 → 完整流年运势 ─────────────
         if birth_date_str:
@@ -372,19 +396,19 @@ class HoroscopeDailyTool(ToolSpec):
                 pid: compute_natal_longitude(chart, pid)
                 for pid in PLANETS
             }
-            transits = compute_transits(natal_positions, today)
+            transits = compute_transits(natal_positions, query_date)
             horoscope = interpret_transits_for_horoscope(transits, chart)
 
             sun_sign = ZODIAC_SIGNS[chart.sun_sign]
 
             trace_lines = [
-                f"执行: horoscope_daily(birth_date={birth_date}, mode=full_transit)",
+                f"执行: horoscope_daily(birth_date={birth_date}, query_date={query_date}, mode=full_transit)",
                 f"本命: ☉{sun_sign.name} ☽{ZODIAC_SIGNS[chart.moon_sign].name} ↑{ZODIAC_SIGNS[chart.ascendant_sign].name}",
-                f"流年: {len(transits)} 相位 | 综合={horoscope['overall']['level']}",
+                f"流年({query_date}): {len(transits)} 相位 | 综合={horoscope['overall']['level']}",
             ]
 
             _step_log("Step 4/4 返回完整流年运势",
-                      sun=sun_sign.name,
+                      sun=sun_sign.name, query_date=query_date.isoformat(),
                       overall=horoscope["overall"]["level"])
 
             return ToolResult(
@@ -392,7 +416,7 @@ class HoroscopeDailyTool(ToolSpec):
                 success=True,
                 output={
                     "mode": "personalized_transit",
-                    "date": today.isoformat(),
+                    "date": query_date.isoformat(),
                     "sun_sign": f"{sun_sign.symbol} {sun_sign.name}",
                     "moon_sign": f"{ZODIAC_SIGNS[chart.moon_sign].symbol} {ZODIAC_SIGNS[chart.moon_sign].name}",
                     "ascendant": f"{ZODIAC_SIGNS[chart.ascendant_sign].symbol} {ZODIAC_SIGNS[chart.ascendant_sign].name}",
@@ -425,19 +449,20 @@ class HoroscopeDailyTool(ToolSpec):
 
         sign_info = ZODIAC_SIGNS[sign_id]
 
-        # 计算今天太阳在哪个星座 → 作为运势基调参考
-        sun_lon_today = _engine_compute_sun_lon(today)
+        # 计算查询日太阳在哪个星座 → 作为运势基调参考
+        sun_lon_today = _engine_compute_sun_lon(query_date)
         sun_sign_today = _engine_longitude_to_sign(sun_lon_today)
 
         _step_log("Step 3/4 通用运势生成",
                   sign=sign_info.name, element=sign_info.element.value,
                   modality=sign_info.modality.value,
-                  sun_today_in=ZODIAC_SIGNS[sun_sign_today].name)
+                  query_date=query_date.isoformat(),
+                  sun_in=ZODIAC_SIGNS[sun_sign_today].name)
 
         # 简单运势生成
         from app.domain_packs.metacare._astrology_engine import compute_planet_longitude
-        venus_lon = compute_planet_longitude("venus", today)
-        mars_lon = compute_planet_longitude("mars", today)
+        venus_lon = compute_planet_longitude("venus", query_date)
+        mars_lon = compute_planet_longitude("mars", query_date)
         venus_sign = _engine_longitude_to_sign(venus_lon)
         mars_sign = _engine_longitude_to_sign(mars_lon)
 
@@ -451,7 +476,7 @@ class HoroscopeDailyTool(ToolSpec):
 
         # 火星位置影响行动力
         if mars_sign == sign_id:
-            work_level, work_text = "⭐⭐⭐ 旺", f"火星正经过你的星座，行动力和决断力爆棚。今天适合推进重要项目和做出关键决策。"
+            work_level, work_text = "⭐⭐⭐ 旺", f"火星正经过你的星座，行动力和决断力爆棚。该日适合推进重要项目和做出关键决策。"
         elif ZODIAC_SIGNS[mars_sign].element == sign_info.element:
             work_level, work_text = "⭐⭐ 平", f"火星在同元素星座{mars_sign}，工作节奏平稳，按计划推进即可。"
         else:
@@ -461,26 +486,27 @@ class HoroscopeDailyTool(ToolSpec):
         sun_same = (sun_sign_today == sign_id)
         if sun_same:
             overall_level = "⭐⭐⭐ 旺"
-            overall_text = f"今天是你的太阳回归期附近！太阳正经过你的星座，整体能量充盈，各方面运势都在高位。"
+            overall_text = f"太阳正经过你的星座，整体能量充盈，各方面运势都在高位。"
         else:
             overall_level = "⭐⭐ 平"
-            overall_text = f"太阳当前在{ZODIAC_SIGNS[sun_sign_today].name}。作为{sign_info.element.value}象{sign_info.modality.value}星座，今天适合{f'发挥你的{sign_info.sun_traits[0]}特质' if sign_info.sun_traits else '按日常节奏推进'}。"
+            overall_text = f"太阳当前在{ZODIAC_SIGNS[sun_sign_today].name}。作为{sign_info.element.value}象{sign_info.modality.value}星座，该日适合{f'发挥你的{sign_info.sun_traits[0]}特质' if sign_info.sun_traits else '按日常节奏推进'}。"
 
         trace_lines = [
-            f"执行: horoscope_daily(sign={sign_id}, mode=general)",
-            f"太阳在{ZODIAC_SIGNS[sun_sign_today].name} | 金星在{ZODIAC_SIGNS[venus_sign].name} | 火星在{ZODIAC_SIGNS[mars_sign].name}",
+            f"执行: horoscope_daily(sign={sign_id}, query_date={query_date}, mode=general)",
+            f"查询日 {query_date}: 太阳在{ZODIAC_SIGNS[sun_sign_today].name} | 金星在{ZODIAC_SIGNS[venus_sign].name} | 火星在{ZODIAC_SIGNS[mars_sign].name}",
             f"综合={overall_level} 爱情={love_level} 事业={work_level}",
         ]
 
         _step_log("Step 4/4 返回通用运势",
-                  overall=overall_level, love=love_level, work=work_level)
+                  overall=overall_level, love=love_level, work=work_level,
+                  query_date=query_date.isoformat())
 
         return ToolResult(
             tool_id=self.tool_id,
             success=True,
             output={
                 "mode": "general",
-                "date": today.isoformat(),
+                "date": query_date.isoformat(),
                 "sign": sign_info.name,
                 "symbol": sign_info.symbol,
                 "element": sign_info.element.value,
